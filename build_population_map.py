@@ -336,66 +336,55 @@ def build_weighted_heat_data(
 
     return df[[lat_col, lon_col, "heat_weight"]].values.tolist()
 
-def add_population_intensity_circles(
-    map_obj,
-    aggregated_df,
-    lat_col="lat",
-    lon_col="lon",
-    weight_col="household_count_sum",
-):
-    """
-    Optional circle layer for zoomed-in inspection. Hidden by default.
-    Larger household totals get bigger, warmer-colored circles.
-    """
-    required_cols = {lat_col, lon_col, weight_col}
-    missing_cols = required_cols - set(aggregated_df.columns)
-    if missing_cols:
-        raise ValueError(
-            f"Aggregated dataframe is missing required circle-layer columns: {sorted(missing_cols)}"
-        )
+def _add_inline_heatmap(map_obj, heat_data):
+    """Embed heatmap data directly in the HTML (standalone mode). Off by default."""
+    HeatMap(
+        heat_data,
+        radius=24, blur=20, max_zoom=17, min_opacity=0.12,
+        gradient={
+            0.05: "#2c7fb8", 0.20: "#41b6c4", 0.40: "#a1dab4",
+            0.60: "#fecc5c", 0.78: "#fd8d3c", 0.90: "#f03b20", 1.00: "#bd0026",
+        },
+        name="Population heatmap",
+        show=False,
+    ).add_to(map_obj)
 
-    layer = folium.FeatureGroup(name="Population intensity circles", show=False)
+def _add_lazy_heatmap(map_obj):
+    """Add an empty (off-by-default) HeatMap layer whose data is fetched from
+    data/heatmap.json on page load. Keeps the HTML small for low-RAM machines."""
+    heat_layer = HeatMap(
+        [],
+        radius=24, blur=20, max_zoom=17, min_opacity=0.12,
+        gradient={
+            0.05: "#2c7fb8", 0.20: "#41b6c4", 0.40: "#a1dab4",
+            0.60: "#fecc5c", 0.78: "#fd8d3c", 0.90: "#f03b20", 1.00: "#bd0026",
+        },
+        name="Population heatmap",
+        show=False,
+    )
+    heat_layer.add_to(map_obj)
+    layer_name = heat_layer.get_name()
 
-    for _, row in aggregated_df.iterrows():
-        value = float(row[weight_col])
-
-        if value <= 50:
-            radius = 2
-            color = "#2c7fb8"
-            fill_opacity = 0.20
-        elif value <= 200:
-            radius = 3
-            color = "#41b6c4"
-            fill_opacity = 0.25
-        elif value <= 800:
-            radius = 5
-            color = "#7fcdbb"
-            fill_opacity = 0.30
-        elif value <= 2500:
-            radius = 7
-            color = "#c7e9b4"
-            fill_opacity = 0.35
-        elif value <= 10000:
-            radius = 10
-            color = "#fdae61"
-            fill_opacity = 0.42
-        else:
-            radius = 13
-            color = "#d73027"
-            fill_opacity = 0.50
-
-        folium.CircleMarker(
-            location=[float(row[lat_col]), float(row[lon_col])],
-            radius=radius,
-            color=color,
-            weight=0,
-            fill=True,
-            fill_color=color,
-            fill_opacity=fill_opacity,
-            opacity=0,
-        ).add_to(layer)
-
-    layer.add_to(map_obj)
+    js = f"""
+<script>
+(function() {{
+    window.addEventListener('load', function() {{
+        fetch('data/heatmap.json')
+            .then(function(r) {{ return r.json(); }})
+            .then(function(data) {{
+                try {{
+                    {layer_name}.setLatLngs(data);
+                    {layer_name}.redraw();
+                }} catch(e) {{
+                    console.warn('Heatmap lazy load failed:', e);
+                }}
+            }})
+            .catch(function(e) {{ console.warn('heatmap.json fetch failed:', e); }});
+    }});
+}})();
+</script>
+"""
+    map_obj.get_root().html.add_child(folium.Element(js))
 
 def build_nearest_hospital_lookup(population_df, hospital_df, sample_size=5000):
     """
@@ -885,6 +874,8 @@ def build_population_map(
     max_marker_points=1000,
     min_lat=None,
     max_lat=None,
+    server_mode=False,
+    _data_out=None,
 ):
     population_df = load_pickle(population_path)
 
@@ -940,31 +931,17 @@ def build_population_map(
         clip_quantile=0.995,
     )
 
-    HeatMap(
-        heat_data,
-        radius=24,
-        blur=20,
-        max_zoom=17,
-        min_opacity=0.12,
-        gradient={
-            0.05: "#2c7fb8",
-            0.20: "#41b6c4",
-            0.40: "#a1dab4",
-            0.60: "#fecc5c",
-            0.78: "#fd8d3c",
-            0.90: "#f03b20",
-            1.00: "#bd0026",
-        },
-        name="Population heatmap",
-    ).add_to(m)
+    # Round coordinates to ~10 m precision (4 decimals). Shrinks the heatmap
+    # payload ~30% with no visible difference — helps both inline and lazy modes.
+    heat_data = [[round(r[0], 4), round(r[1], 4), round(r[2], 4)] for r in heat_data]
 
-    add_population_intensity_circles(
-        map_obj=m,
-        aggregated_df=aggregated_population_df,
-        lat_col="lat",
-        lon_col="lon",
-        weight_col="household_count_sum",
-    )
+    if server_mode:
+        # Heatmap data lives in data/heatmap.json; the HTML carries only a loader.
+        if _data_out is not None:
+            _data_out["heat_data"] = heat_data
+        _add_lazy_heatmap(m)
+    else:
+        _add_inline_heatmap(m, heat_data)
 
     hospital_marker_lookup = {}
     hospital_panel_data = {}
@@ -1009,7 +986,7 @@ def build_population_map(
             print(hospitals_df["specialized_equipment"].value_counts(dropna=False))
 
             if "Latitude" in hospitals_df.columns and "Longitude" in hospitals_df.columns:
-                cluster = MarkerCluster(name="Hospitals").add_to(m)
+                cluster = MarkerCluster(name="Hospitals", show=False).add_to(m)
 
                 for _, row in hospitals_df.iterrows():
                     hospital_id = safe_int(row.get("ID"))
@@ -1156,7 +1133,7 @@ def build_population_map(
         print("Distance source breakdown:")
         print(interactive_df["distance_source"].value_counts(dropna=False))
 
-    marker_cluster = MarkerCluster(name="Population points").add_to(m)
+    marker_cluster = MarkerCluster(name="Population points", show=False).add_to(m)
 
     route_data = {}
     population_marker_lookup = {}
@@ -1231,6 +1208,9 @@ def build_population_map(
                     route_data[str(pop_id)][str(hospital_id)] = coords
 
 
+    if _data_out is not None:
+        _data_out["route_data"] = route_data
+
     inject_side_panel_and_routes(
         m,
         route_data,
@@ -1238,6 +1218,7 @@ def build_population_map(
         population_marker_lookup,
         hospital_panel_data,
         hospital_marker_lookup,
+        server_mode=server_mode,
     )
 
     folium.LayerControl().add_to(m)
