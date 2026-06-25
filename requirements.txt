@@ -1,0 +1,19 @@
+# Python dependencies for the Vietnam stroke-care accessibility pipeline.
+# Pinned to the versions used to produce the thesis results (Python 3.11.9).
+#
+# Reproduce the environment:
+#   python -m venv .venv
+#   .\.venv\Scripts\python.exe -m pip install -r requirements.txt   # Windows
+#   ./.venv/bin/python -m pip install -r requirements.txt           # macOS/Linux
+
+# Core analysis pipeline (run_dwebc / run_metrics / run_optimisation)
+networkx==3.3
+numpy==2.1.1
+pandas==3.0.3
+scipy==1.17.1
+
+# Plotting (make_plots, fig6 recovery curve)
+matplotlib==3.9.2
+
+# Interactive map builders (build_population_map, build_*_map)
+folium==0.20.0
