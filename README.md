@@ -1,27 +1,40 @@
-### Running the map
-1. Place build_population_map.py and map_ui.py in the same folder as your data:
+# Advanced Stroke-Care Coverage in Vietnam
 
-  - population.pkl
-  - all_hospitals.pkl
-  - distances_osm_max_300km.pkl
-  - road_osm_preprocessed.geojson
-  - stroke-facs-100-en.csv
+Optimisation code and interactive artifact for a BSc thesis on **where to upgrade
+or build advanced stroke-care centers in Vietnam** to maximise the population
+reached within a clinical time standard, for a given budget. A two-stage
+maximum-covering model (MCLP) solved over budgets and time thresholds on real
+per-road-type travel times.
 
-2. Change the folder paths in the file to your folder path, around line 40.
+## Layout
 
-3. Run the build_population_map.py file.
+**`01_optimization_models/`** — the location models
+- `greenfield_existing_advanced_model.py` — core two-stage MCLP: pick which existing hospitals to upgrade and which greenfield sites to build to maximise covered demand within a budget. Provides the data-loading/assignment helpers reused elsewhere.
+- `baseline_upgrade_model.py` — simpler upgrade-only baseline (no new builds).
 
-4. Open the generated population_map.html in your browser.
+**`02_travel_time/`** — road-graph travel times (minutes)
+- `corrected_roadtime_grid.py` — the main pipeline: builds within-threshold road-time matrices (Dijkstra on per-road-type speeds) and solves every budget×threshold scenario. Fixes the coverage bug and produces the canonical thesis outputs + map data.
+- `build_travel_time_matrices.py` — precomputes the pop→facility travel-time matrices used by the roadtime scenarios.
 
-### Configuration
-You can change the size of the sample of the population points being displayed. Beware the entire population point dataset will likely crash your browser or run for multiple hours.
+**`03_scenarios/`** — scenario generation and coverage analysis
+- `run_combined_scenarios.py` — solves the model across the budget×radius grid (`--mode km/time/roadtime`).
+- `true_advanced_baseline.py` — diagnostic: true road coverage of the existing centers (proved the data bug).
+- `time_to_treatment_extension.py` — travel-time (minutes) version of the coverage analysis.
 
-There are two ways to change that:
-- Adjust sample size (default 1000 interactive population points):
-- Restrict by latitude (for faster testing on a subregion):
-either in this function definition: 
-<img width="514" height="274" alt="image" src="https://github.com/user-attachments/assets/81f82639-d241-4b26-bc6f-8e966e1550c2" />
+**`04_robustness/`**
+- `robustness_corrected.py` — radius / speed / cost robustness checks.
 
-or in the function call at the end of the file: 
-<img width="395" height="178" alt="image" src="https://github.com/user-attachments/assets/f63e9ae5-d80b-4ace-8aa6-26ab058fb48c" />
+**`06_interactive_map/`** — the self-contained HTML explorer
+- `build_population_map.py` — builds the interactive map (heatmap, hospitals, scenario slider, click-to-route).
+- `map_ui.py` — the injected side-panel HTML/CSS/JS imported by the builder.
+- `point_coloring_overlay.js` — overlay colouring population points by access time / serving facility.
+- `add_point_coloring.py` — injects the overlay into an already-built map HTML.
 
+## Setup
+
+```bash
+pip install -r requirements.txt
+```
+
+Scripts read a `data/` folder and write to `outputs/`/`maps/` (not included here —
+large and reproducible).
