@@ -30,6 +30,7 @@ import json
 import os
 import pickle
 from collections import Counter
+from pathlib import Path
 
 import folium
 import networkx as nx
@@ -39,6 +40,13 @@ from folium.plugins import HeatMap, MarkerCluster
 
 # UI helper: contains the injected HTML/CSS/JavaScript side panel.
 from map_ui import inject_side_panel_and_routes
+
+# Project layout: this script lives in code/, with data/ and outputs/ as
+# siblings of code/ under the repository root. Defaults below are derived from
+# this so the script runs without arguments from anywhere.
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+OUTPUTS_DIR = BASE_DIR / "outputs"
 
 # We use KDTree to quickly find the nearest road-network node
 # for each population point and each hospital point.
@@ -397,6 +405,51 @@ def add_population_intensity_circles(
 
     layer.add_to(map_obj)
 
+def add_underserved_overlay(map_obj, population_df, assignments_path, label):
+    """
+    Toggleable heatmap of the population a representative optimum leaves behind.
+
+    Reads the covered population points from a model assignments CSV (pop_id of every
+    covered point) and draws a heatmap of the demand of all OTHER points -- i.e. who
+    the optimal plan does not reach. Hidden by default; a distinct magenta gradient
+    distinguishes it from the blue-to-red population heatmap. This makes the
+    urban-rural equity gap visible directly on the map.
+    """
+    if not assignments_path or not os.path.exists(assignments_path):
+        print("No underserved-assignments file found; skipping underserved overlay.")
+        return
+
+    cov = pd.read_csv(assignments_path)
+    if "pop_id" not in cov.columns:
+        print("Assignments file lacks 'pop_id'; skipping underserved overlay.")
+        return
+    covered_ids = set(ensure_numeric(cov["pop_id"]).dropna().astype(int))
+
+    df = population_df.copy()
+    df["ID"] = ensure_numeric(df["ID"])
+    df = df.dropna(subset=["ID"])
+    uncovered = df[~df["ID"].astype(int).isin(covered_ids)].copy()
+    if len(uncovered) == 0:
+        print("No uncovered points; skipping underserved overlay.")
+        return
+
+    agg = aggregate_population_for_visualization(
+        uncovered, lat_col="lat", lon_col="lon", weight_col="household_count")
+    heat = build_weighted_heat_data(
+        agg, lat_col="lat", lon_col="lon", weight_col="household_count_sum",
+        clip_quantile=0.995)
+
+    HeatMap(
+        heat, radius=22, blur=18, max_zoom=17, min_opacity=0.20,
+        gradient={
+            0.10: "#fbb4b9", 0.35: "#f768a1", 0.60: "#dd3497",
+            0.80: "#ae017e", 1.00: "#7a0177",
+        },
+        name=label, show=False,
+    ).add_to(map_obj)
+    print(f"Underserved overlay added: {len(uncovered):,} uncovered points "
+          f"({len(covered_ids):,} covered) from {os.path.basename(assignments_path)}")
+
 def build_nearest_hospital_lookup(population_df, hospital_df, sample_size=5000):
     """
     Sample population points and match each to its nearest hospital by
@@ -657,215 +710,217 @@ def snap_points_to_graph_nodes(df, lat_col, lon_col, tree, node_list, label):
 
     return out
 
-def build_top_k_hospital_popup_data(
+# -----------------------------------------------------------------------------
+# Scenario-aware facility assignment
+# -----------------------------------------------------------------------------
+# The interactive map must assign every population point to the nearest facility
+# that is ADVANCED (thrombectomy-capable) *under the currently selected scenario*,
+# not only the existing advanced hospitals. The universe of facilities that can
+# ever be advanced is collected here directly from the pre-computed scenario JSON:
+#   - existing advanced hospitals (always open)
+#   - basic hospitals chosen for upgrade in some (budget, radius)
+#   - greenfield sites built in some (budget, radius)
+# We then compute the ROAD distance and travel time from every clickable
+# population point to each of these facilities once, at build time. The browser
+# picks the nearest *active* facility for whatever budget/radius the user selects.
+# -----------------------------------------------------------------------------
+def build_facility_universe_from_scenarios(scenarios):
+    """
+    Collect every facility that acts as an advanced site in at least one
+    scenario, with coordinates taken straight from the scenario JSON.
+
+    Returns: dict {facility_id(int): {"lat", "lon", "kind"}}, where kind is one
+    of "advanced" (existing), "upgrade" (basic hospital upgraded in some
+    scenario) or "greenfield" (new site built in some scenario).
+    """
+    universe = {}
+    if not scenarios:
+        return universe
+
+    for rec in scenarios.get("existing_advanced", []):
+        fid = safe_int(rec.get("id"))
+        if fid is None:
+            continue
+        universe[fid] = {"lat": float(rec["lat"]), "lon": float(rec["lon"]), "kind": "advanced"}
+
+    for by_budget in scenarios.get("scenarios", {}).values():
+        for s in by_budget.values():
+            for rec in s.get("upgrades", []):
+                fid = safe_int(rec.get("id"))
+                if fid is not None and fid not in universe:
+                    universe[fid] = {"lat": float(rec["lat"]), "lon": float(rec["lon"]), "kind": "upgrade"}
+            for rec in s.get("greenfield", []):
+                fid = safe_int(rec.get("id"))
+                if fid is not None and fid not in universe:
+                    universe[fid] = {"lat": float(rec["lat"]), "lon": float(rec["lon"]), "kind": "greenfield"}
+
+    kinds = Counter(v["kind"] for v in universe.values())
+    print("Facility universe for assignment:")
+    print(f"  Total facilities: {len(universe)}  (by kind: {dict(kinds)})")
+    return universe
+
+
+def build_assignment_distances(
     interactive_df,
-    hospital_snap_df,
+    facility_universe,
     graph,
-    k=3,
+    tree,
+    node_list,
+    hospital_name_lookup=None,
+    speed_kmh=40.0,
+    max_total_km=300.0,
+    time_model="flat",
+    max_total_min=600.0,
 ):
     """
-    Build hospital data using road-adjusted speed model only.
-    Routes are only calculated for hospitals within 300 km straight-line distance.
-    Result is stored as JSON in top_k_hospitals_json per population row.
+    Road distance + travel time from every sampled population point to every
+    facility in the universe.
+
+    We run a single-source shortest-path FROM each facility, because there are far
+    fewer facilities (~150) than clickable population points (~1000), so this is
+    the cheap direction and gives the result to every population node in one pass.
+
+    Two travel-time models:
+      time_model="flat"  -> route = shortest by road length_km; travel time is the
+                            single-average translation  time_min = total_km/speed*60.
+      time_model="road"  -> route = fastest by per-road-type travel_time_min
+                            (motorway/primary/secondary/local + unpaved penalty);
+                            travel time is the summed segment time, distance is the
+                            length along that fastest route. Off-network snap legs
+                            are converted at `speed_kmh`.
+
+    Distance mirrors the precomputed OSM matrix:
+        total_km = pop_to_graph_km + network_km + facility_to_graph_km
+
+    Returns (assign_dist, facility_meta):
+      assign_dist  : {str(pop_id): {str(fac_id): [dist_km, time_min]}}
+      facility_meta: {str(fac_id): {"lat", "lon", "kind", "name"}}
     """
-    MAX_ROUTE_DISTANCE_KM = 300.0
-    out = interactive_df.copy()
+    assign_dist = {}
+    facility_meta = {}
+    if not facility_universe:
+        print("No facility universe available; skipping assignment distances.")
+        return assign_dist, facility_meta, {}
 
-    required_pop_cols = {
-        "ID",
-        "lat",
-        "lon",
-        "population_graph_node",
-        "population_graph_lon",
-        "population_graph_lat",
-        "population_to_graph_km",
-    }
-    missing_pop_cols = [c for c in required_pop_cols if c not in out.columns]
-    if missing_pop_cols:
-        print(f"Cannot build top-k hospital popup data. Missing population columns: {missing_pop_cols}")
-        out["top_k_hospitals_json"] = "[]"
-        return out
+    needed = {"ID", "population_graph_node", "population_to_graph_km"}
+    missing = needed - set(interactive_df.columns)
+    if missing:
+        print(f"Cannot build assignment distances; missing population columns: {sorted(missing)}")
+        return assign_dist, facility_meta, {}
 
-    required_hosp_cols = {
-        "ID",
-        "Latitude",
-        "Longitude",
-        "specialized_equipment",
-        "hospital_graph_node",
-        "hospital_graph_lon",
-        "hospital_graph_lat",
-        "hospital_to_graph_km",
-    }
-    missing_hosp_cols = [c for c in required_hosp_cols if c not in hospital_snap_df.columns]
-    if missing_hosp_cols:
-        print(f"Cannot build top-k hospital popup data. Missing hospital columns: {missing_hosp_cols}")
-        out["top_k_hospitals_json"] = "[]"
-        return out
-
-    hosp_df = hospital_snap_df.copy()
-    hosp_df["ID"] = ensure_numeric(hosp_df["ID"])
-    hosp_df = hosp_df.dropna(subset=["ID", "Latitude", "Longitude"]).copy()
-    hosp_df["ID"] = hosp_df["ID"].astype(int)
-
-    hosp_coords = hosp_df[["Latitude", "Longitude"]].to_numpy(dtype=float)
-    hosp_ids = hosp_df["ID"].to_numpy(dtype=int)
-
-    hospital_lookup = {}
-    for _, row in hosp_df.iterrows():
-        hospital_lookup[int(row["ID"])] = row
-
-    route_cache = {}
-    computed_rows = 0
-    no_path_count = 0
-    bad_node_count = 0
-    skipped_too_far = 0
-
-    for idx, row in out.iterrows():
-        pop_lat = row.get("lat")
-        pop_lon = row.get("lon")
-        pop_node = row.get("population_graph_node")
-        pop_graph_lat = row.get("population_graph_lat")
-        pop_graph_lon = row.get("population_graph_lon")
-        pop_offset_km = row.get("population_to_graph_km")
-
-        if pd.isna(pop_lat) or pd.isna(pop_lon):
-            out.at[idx, "top_k_hospitals_json"] = "[]"
+    # Population points already carry their snapped graph node + snap offset.
+    pop_rows = []
+    for _, row in interactive_df.iterrows():
+        pid = safe_int(row.get("ID"))
+        node = row.get("population_graph_node")
+        off = row.get("population_to_graph_km")
+        if pid is None or node is None or pd.isna(off) or node not in graph:
             continue
+        pop_rows.append((str(pid), node, float(off)))
+        assign_dist[str(pid)] = {}
 
-        pop_coord = np.array([[float(pop_lat), float(pop_lon)]], dtype=float)
-        coord_dists = np.sum((hosp_coords - pop_coord) ** 2, axis=1)
+    if not pop_rows:
+        print("No snapped population points available for assignment distances.")
+        return assign_dist, facility_meta, {}
 
-        top_k = min(k, len(hosp_df))
-        top_idx = np.argsort(coord_dists)[:top_k]
+    # Snap facilities to graph nodes via the shared road-node KDTree.
+    fac_ids = list(facility_universe.keys())
+    fac_lonlat = np.array(
+        [[facility_universe[f]["lon"], facility_universe[f]["lat"]] for f in fac_ids],
+        dtype=float,
+    )
+    _, fac_idxs = tree.query(fac_lonlat, k=1)
 
-        hospital_results = []
+    name_lookup = hospital_name_lookup or {}
+    fac_node_of = {}
+    routed = 0
+    for fpos, fid in enumerate(fac_ids):
+        meta = facility_universe[fid]
+        fac_node = node_list[fac_idxs[fpos]]
+        fac_off = float(haversine_km(meta["lat"], meta["lon"], fac_node[1], fac_node[0]))
 
-        for hosp_array_idx in top_idx:
-            hosp_id = int(hosp_ids[hosp_array_idx])
-            hosp_row = hospital_lookup[hosp_id]
+        if meta["kind"] == "greenfield":
+            name = f"Greenfield site {fid}"
+        else:
+            name = name_lookup.get(str(fid)) or f"Hospital {fid}"
+        facility_meta[str(fid)] = {
+            "lat": meta["lat"],
+            "lon": meta["lon"],
+            "kind": meta["kind"],
+            "name": name,
+        }
 
-            specialized = bool(hosp_row.get("specialized_equipment", False))
-            hosp_node = hosp_row.get("hospital_graph_node")
-            hosp_graph_lat = hosp_row.get("hospital_graph_lat")
-            hosp_graph_lon = hosp_row.get("hospital_graph_lon")
-            hosp_lat = hosp_row.get("Latitude")
-            hosp_lon = hosp_row.get("Longitude")
-            hosp_offset_km = hosp_row.get("hospital_to_graph_km")
+        if fac_node not in graph:
+            continue
+        fac_node_of[str(fid)] = fac_node
 
-            straight_line_km = float(haversine_km(pop_lat, pop_lon, hosp_lat, hosp_lon))
+        if time_model == "road":
+            # Travel time from the fastest route by differentiated per-road-type
+            # speeds; distance from the shortest road route. Both are cheap
+            # path-length passes (no per-node path reconstruction).
+            fac_off_min = fac_off / speed_kmh * 60.0
+            times = nx.single_source_dijkstra_path_length(
+                graph, fac_node, weight="travel_time_min", cutoff=max_total_min)
+            lengths = nx.single_source_dijkstra_path_length(graph, fac_node, weight="length_km")
+            for pid, pnode, poff in pop_rows:
+                net_min = times.get(pnode)
+                if net_min is None:
+                    continue
+                net_km = lengths.get(pnode)
+                if net_km is None:
+                    continue
+                total_km = poff + float(net_km) + fac_off
+                total_min = (poff / speed_kmh * 60.0) + float(net_min) + fac_off_min
+                assign_dist[pid][str(fid)] = [round(total_km, 2), round(total_min, 1)]
+        else:
+            # Shortest route by distance; single-average-speed travel time.
+            lengths = nx.single_source_dijkstra_path_length(graph, fac_node, weight="length_km")
+            for pid, pnode, poff in pop_rows:
+                net = lengths.get(pnode)
+                if net is None:
+                    continue
+                total = poff + float(net) + fac_off
+                if total > max_total_km:
+                    continue
+                assign_dist[pid][str(fid)] = [round(total, 2), round(total / speed_kmh * 60.0, 1)]
 
-            if straight_line_km > MAX_ROUTE_DISTANCE_KM:
-                skipped_too_far += 1
-                hospital_results.append({
-                    "hospital_id": hosp_id,
-                    "specialized_equipment": specialized,
-                    "distance_km": None,
-                    "estimated_travel_time_min": None,
-                    "route_available": False,
-                    "route_coords": None,
-                })
+        routed += 1
+        if routed % 25 == 0:
+            print(f"  Assignment distances: routed from {routed}/{len(fac_ids)} facilities...")
+
+    n_with = sum(1 for v in assign_dist.values() if v)
+    print("Assignment distance summary:")
+    print(f"  Facilities routed: {routed}/{len(fac_ids)}")
+    print(f"  Population points with >=1 reachable facility: {n_with}/{len(assign_dist)}")
+
+    # --- actual road-path geometry for the displayed points (drawn on click) ---
+    # For each point, store the real road polyline to its nearest few facilities, so
+    # the map can draw the true route to whichever facility is open in the scenario.
+    assign_path = {}
+    K_PATHS = 5
+    pnode_of = {pid: pnode for pid, pnode, _ in pop_rows}
+    for pid, fac_km in assign_dist.items():
+        pnode = pnode_of.get(pid)
+        if not fac_km or pnode is None:
+            continue
+        paths = {}
+        for fid, _ in sorted(fac_km.items(), key=lambda kv: kv[1][0])[:K_PATHS]:
+            fnode = fac_node_of.get(fid)
+            if fnode is None:
                 continue
-
-            route_distance_km = None
-            route_time_min = None
-            route_coords = None
-
-            if (
-                pop_node is not None
-                and hosp_node is not None
-                and not pd.isna(pop_offset_km)
-                and not pd.isna(hosp_offset_km)
-                and pop_node in graph
-                and hosp_node in graph
-            ):
-                cache_key = (pop_node, hosp_node)
-
-                if cache_key in route_cache:
-                    cached = route_cache[cache_key]
-                else:
-                    cached = {"km": None, "time_min": None, "coords": None}
-
-                    try:
-                        nodes = nx.shortest_path(
-                            graph,
-                            source=pop_node,
-                            target=hosp_node,
-                            weight="travel_time_min"
-                        )
-
-                        network_km = 0.0
-                        network_time_min = 0.0
-
-                        for u, v in zip(nodes[:-1], nodes[1:]):
-                            edge = graph[u][v]
-                            network_km += float(edge["length_km"])
-                            network_time_min += float(edge["travel_time_min"])
-
-                        coords = []
-                        add_coord_if_valid(coords, pop_lat, pop_lon)
-                        add_coord_if_valid(coords, pop_graph_lat, pop_graph_lon)
-
-                        for node in nodes:
-                            lon, lat = node
-                            add_coord_if_valid(coords, lat, lon)
-
-                        add_coord_if_valid(coords, hosp_graph_lat, hosp_graph_lon)
-                        add_coord_if_valid(coords, hosp_lat, hosp_lon)
-
-                        cached["km"] = float(pop_offset_km) + network_km + float(hosp_offset_km)
-                        cached["time_min"] = network_time_min
-                        cached["coords"] = coords
-
-                    except nx.NetworkXNoPath:
-                        no_path_count += 1
-                    except nx.NodeNotFound:
-                        bad_node_count += 1
-
-                    route_cache[cache_key] = cached
-
-                route_distance_km = cached["km"]
-                route_time_min = cached["time_min"]
-                route_coords = cached["coords"]
-            else:
-                bad_node_count += 1
-
-            hospital_results.append({
-                "hospital_id": hosp_id,
-                "specialized_equipment": specialized,
-                "distance_km": route_distance_km,
-                "estimated_travel_time_min": route_time_min,
-                "route_available": route_coords is not None and len(route_coords) >= 2,
-                "route_coords": route_coords,
-            })
-
-        hospital_results.sort(
-            key=lambda h: (
-                h["estimated_travel_time_min"] is None
-                or (isinstance(h["estimated_travel_time_min"], float) and pd.isna(h["estimated_travel_time_min"])),
-                float(h["estimated_travel_time_min"])
-                if h["estimated_travel_time_min"] is not None
-                and not (isinstance(h["estimated_travel_time_min"], float) and pd.isna(h["estimated_travel_time_min"]))
-                else float("inf")
-            )
-        )
-
-        for rank, hosp in enumerate(hospital_results, start=1):
-            hosp["rank"] = rank
-
-        out.at[idx, "top_k_hospitals_json"] = json.dumps(hospital_results)
-        computed_rows += 1
-
-        if computed_rows % 100 == 0:
-            print(f"  Built hospital data for {computed_rows} population rows...")
-
-    print(f"Hospital popup data complete.")
-    print(f"  Population rows processed: {computed_rows}")
-    print(f"  No-path cases: {no_path_count}")
-    print(f"  Bad/missing node cases: {bad_node_count}")
-    print(f"  Skipped (>300 km): {skipped_too_far}")
-    print(f"  Cached route pairs: {len(route_cache)}")
-
-    return out
+            try:
+                _, node_path = nx.bidirectional_dijkstra(graph, pnode, fnode, weight="length_km")
+            except Exception:
+                continue
+            coords = [[round(n[1], 5), round(n[0], 5)] for n in node_path]  # node=(lon,lat)->[lat,lon]
+            if len(coords) > 60:                      # downsample very long routes
+                step = len(coords) // 60 + 1
+                coords = coords[::step] + [coords[-1]]
+            paths[fid] = coords
+        if paths:
+            assign_path[pid] = paths
+    print(f"  Road-path geometry stored for {len(assign_path)}/{len(assign_dist)} points")
+    return assign_dist, facility_meta, assign_path
 
 # Main map builder
 # -----------------------------------------------------------------------------
@@ -885,6 +940,10 @@ def build_population_map(
     max_marker_points=1000,
     min_lat=None,
     max_lat=None,
+    scenarios_path=None,
+    show_intensity_circles=False,
+    time_model="flat",
+    underserved_assignments_path=None,
 ):
     population_df = load_pickle(population_path)
 
@@ -958,13 +1017,25 @@ def build_population_map(
         name="Population heatmap",
     ).add_to(m)
 
-    add_population_intensity_circles(
-        map_obj=m,
-        aggregated_df=aggregated_population_df,
-        lat_col="lat",
-        lon_col="lon",
-        weight_col="household_count_sum",
-    )
+    # The intensity-circles layer renders ~134k individual CircleMarkers, which
+    # bloats the HTML to ~70 MB and makes the browser laggy. The heatmap already
+    # conveys population density, so this layer is opt-in via --intensity-circles.
+    if show_intensity_circles:
+        add_population_intensity_circles(
+            map_obj=m,
+            aggregated_df=aggregated_population_df,
+            lat_col="lat",
+            lon_col="lon",
+            weight_col="household_count_sum",
+        )
+
+    # Equity overlay: who the representative optimum (budget 10, R=300 km) leaves
+    # uncovered. Hidden by default; toggled from the layer control.
+    if underserved_assignments_path:
+        add_underserved_overlay(
+            m, population_df, underserved_assignments_path,
+            label="Underserved population (optimum: B=10, R=300 km)",
+        )
 
     hospital_marker_lookup = {}
     hospital_panel_data = {}
@@ -997,6 +1068,11 @@ def build_population_map(
             hospitals_df = hospitals_df.dropna(subset=["ID"]).copy()
             hospitals_df["ID"] = hospitals_df["ID"].astype(int)
 
+            # Keep only the existing hospitals (IDs 0..129). The unified
+            # all_hospitals.pkl in data/ also contains greenfield
+            # candidates (ID >= 130) which must not be drawn as existing hospitals.
+            hospitals_df = hospitals_df[hospitals_df["ID"] < 130].copy()
+
             hospitals_df = hospitals_df.merge(
                 stroke_df,
                 on="ID",
@@ -1009,7 +1085,9 @@ def build_population_map(
             print(hospitals_df["specialized_equipment"].value_counts(dropna=False))
 
             if "Latitude" in hospitals_df.columns and "Longitude" in hospitals_df.columns:
-                cluster = MarkerCluster(name="Hospitals").add_to(m)
+                cluster = MarkerCluster(name="Basic hospitals").add_to(m)
+                advanced_layer = folium.FeatureGroup(
+                    name="Advanced hospitals (existing)", show=True).add_to(m)
 
                 for _, row in hospitals_df.iterrows():
                     hospital_id = safe_int(row.get("ID"))
@@ -1025,20 +1103,25 @@ def build_population_map(
                     if "Address_CSV" in row.index and pd.notna(row.get("Address_CSV")):
                         address_text = str(row["Address_CSV"]).strip()
 
+                    icon_px = 30 if has_specialized else 22
                     hospital_icon_html = build_hospital_icon_html(
                         has_specialized=has_specialized,
-                        size_px=24,
+                        size_px=icon_px,
                     )
 
+                    # Advanced (existing) hospitals go on an always-visible,
+                    # non-clustered layer so they are clearly shown at any zoom;
+                    # basic hospitals are clustered to reduce clutter.
+                    target_layer = advanced_layer if has_specialized else cluster
                     marker = folium.Marker(
                         location=[float(row["Latitude"]), float(row["Longitude"])],
                         icon=folium.DivIcon(
                             html=hospital_icon_html,
-                            icon_size=(24, 24),
-                            icon_anchor=(12, 12),
+                            icon_size=(icon_px, icon_px),
+                            icon_anchor=(icon_px // 2, icon_px // 2),
                             class_name="empty"
                         ),
-                    ).add_to(cluster)
+                    ).add_to(target_layer)
 
                     if hospital_id is not None:
                         hospital_marker_lookup[str(hospital_id)] = marker.get_name()
@@ -1094,6 +1177,32 @@ def build_population_map(
     precomputed_coverage = interactive_df["distance_to_hospital_km"].notna().sum()
     print(f"Precomputed distance coverage for selected hospitals: {precomputed_coverage} / {len(interactive_df)}")
 
+    # Load the pre-computed combined scenarios (budget x radius) up front: they
+    # define the facility universe used for the scenario-aware assignment below
+    # as well as the explorer overlay injected later.
+    greenfield_scenarios = None
+    if scenarios_path and os.path.exists(scenarios_path):
+        try:
+            with open(scenarios_path) as f:
+                greenfield_scenarios = json.load(f)
+            n = len(greenfield_scenarios.get("budgets", [])) * len(greenfield_scenarios.get("radii", []))
+            print(f"Loaded scenario explorer data: {n} scenarios from {scenarios_path}")
+        except Exception as e:
+            print(f"Warning: could not load scenarios file: {e}")
+
+    facility_universe = build_facility_universe_from_scenarios(greenfield_scenarios)
+
+    # Travel-time translation speed: matches the time-to-treatment scenarios
+    # (single average road speed). Read it from the scenario file when present.
+    assignment_speed_kmh = 40.0
+    if greenfield_scenarios and greenfield_scenarios.get("speed_kmh"):
+        assignment_speed_kmh = float(greenfield_scenarios["speed_kmh"])
+
+    # Filled in once the road graph + snapped points are available.
+    assign_dist = {}
+    facility_meta = {}
+    assign_path = {}
+
     # Build graph from roads GeoJSON
     G = None
     tree = None
@@ -1127,27 +1236,29 @@ def build_population_map(
                 label="population",
             )
 
-            hospital_snap_df = hospitals_df.copy()
-            hospital_snap_df = snap_points_to_graph_nodes(
-                hospital_snap_df,
-                lat_col="Latitude",
-                lon_col="Longitude",
+            # Road distance + travel time from each clickable population point to
+            # every facility that can be advanced in some scenario. The browser
+            # then assigns each point to the nearest *active* facility for the
+            # selected budget/radius.
+            hospital_name_lookup = {
+                hid: info.get("hospital_name", "")
+                for hid, info in hospital_panel_data.items()
+            }
+            assign_dist, facility_meta, assign_path = build_assignment_distances(
+                interactive_df=interactive_df,
+                facility_universe=facility_universe,
+                graph=G,
                 tree=tree,
                 node_list=node_list,
-                label="hospital",
-            )
-
-            interactive_df = build_top_k_hospital_popup_data(
-                interactive_df=interactive_df,
-                hospital_snap_df=hospital_snap_df,
-                graph=G,
-                k=3,
+                hospital_name_lookup=hospital_name_lookup,
+                speed_kmh=assignment_speed_kmh,
+                time_model=time_model,
             )
 
         except Exception as e:
-            print(f"Warning: graph snapping or routing failed: {e}")
+            print(f"Warning: graph snapping or assignment routing failed: {e}")
     else:
-        print("Skipping graph snapping/routing because graph is unavailable.")
+        print("Skipping graph snapping/assignment because graph is unavailable.")
 
     final_coverage = interactive_df["distance_to_hospital_km"].notna().sum()
     print(f"Final distance coverage: {final_coverage} / {len(interactive_df)}")
@@ -1158,12 +1269,13 @@ def build_population_map(
 
     marker_cluster = MarkerCluster(name="Population points").add_to(m)
 
-    route_data = {}
     population_marker_lookup = {}
     population_panel_data = {}
 
     for _, row in interactive_df.iterrows():
         pop_id = safe_int(row.get("ID"))
+        if pop_id is None:
+            continue
 
         household_count = (
             int(row["household_count"])
@@ -1171,34 +1283,13 @@ def build_population_map(
             else "N/A"
         )
 
-        top_hospitals = []
-        if row.get("top_k_hospitals_json"):
-            try:
-                top_hospitals = json.loads(row["top_k_hospitals_json"])
-            except Exception:
-                top_hospitals = []
-
-        hospital_cards = []
-
-        for hosp in top_hospitals:
-            hospital_id = hosp.get("hospital_id", "N/A")
-            specialized = bool(hosp.get("specialized_equipment", False))
-
-            hospital_cards.append({
-                "rank": hosp.get("rank", None),
-                "hospital_id": hospital_id,
-                "specialized_equipment": specialized,
-                "distance_km": hosp.get("distance_km"),
-                "estimated_travel_time_min": hosp.get("estimated_travel_time_min"),
-                "route_available": hosp.get("route_available", False),
-            })
-
-        if pop_id is not None:
-            population_panel_data[str(pop_id)] = {
-                "population_id": pop_id,
-                "household_count": household_count,
-                "hospitals": hospital_cards,
-            }
+        # The list of nearby advanced facilities + the assigned one is computed
+        # in the browser from assign_dist, because it depends on the budget/radius
+        # the user selects. The panel data only needs the static point info.
+        population_panel_data[str(pop_id)] = {
+            "population_id": pop_id,
+            "household_count": household_count,
+        }
 
         marker = folium.CircleMarker(
             location=[float(row["lat"]), float(row["lon"])],
@@ -1209,38 +1300,33 @@ def build_population_map(
             fill_opacity=0.7,
         ).add_to(marker_cluster)
 
-        if pop_id is not None:
-            population_marker_lookup[str(pop_id)] = marker.get_name()
+        population_marker_lookup[str(pop_id)] = marker.get_name()
 
-        if pop_id is not None:
-            route_data[str(pop_id)] = {}
-
-            for hosp in top_hospitals:
-                hospital_id = hosp.get("hospital_id", None)
-                if hospital_id is None:
-                    continue
-
-                coords = hosp.get("route_coords", None)
-                route_available = bool(hosp.get("route_available", False))
-
-                if (
-                    route_available
-                    and isinstance(coords, list)
-                    and len(coords) >= 2
-                ):
-                    route_data[str(pop_id)][str(hospital_id)] = coords
-
+    time_label = ("road-adjusted speeds" if time_model == "road"
+                  else f"at {assignment_speed_kmh:.0f} km/h")
 
     inject_side_panel_and_routes(
         m,
-        route_data,
         population_panel_data,
         population_marker_lookup,
         hospital_panel_data,
         hospital_marker_lookup,
+        facility_meta=facility_meta,
+        assign_dist=assign_dist,
+        assign_path=assign_path,
+        greenfield_scenarios=greenfield_scenarios,
+        time_label=time_label,
     )
 
     folium.LayerControl().add_to(m)
+
+    # Population-point colouring overlay (access-time + serving-facility views).
+    # Self-contained JS that reads globals already embedded above; kept in its own
+    # file so it can also be injected into a prebuilt HTML (code/add_point_coloring.py).
+    overlay_js = Path(__file__).resolve().parent / "point_coloring_overlay.js"
+    if overlay_js.exists():
+        m.get_root().html.add_child(folium.Element(overlay_js.read_text()))
+
     m.save(output_path)
     print(f"Map saved to {output_path}")
 
@@ -1251,32 +1337,33 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--population",
-        default="Data_vietnam/population.pkl",
+        default=str(DATA_DIR / "population.pkl"),
         help="Path to population pickle file"
     )
     parser.add_argument(
         "--hospitals",
-        default="Data_vietnam/existing_hospitals_100/all_hospitals.pkl",
+        default=str(DATA_DIR / "all_hospitals.pkl"),
         help="Path to hospitals pickle file"
     )
     parser.add_argument(
         "--distances",
-        default="Data_vietnam/existing_hospitals_100/distances_osm_max_300km.pkl",
+        default=str(DATA_DIR / "distances_osm_max_300km.pkl"),
         help="Path to precomputed road-distance pickle file"
     )
     parser.add_argument(
         "--roads-geojson",
-        default="Data_vietnam/road_osm_preprocessed.geojson",
-        help="Path to road network GeoJSON"
+        default=str(DATA_DIR / "road_osm_preprocessed.geojson"),
+        help="Path to road network GeoJSON (required for routing + assignment; "
+             "pass '' to skip routing and build much faster)"
     )
     parser.add_argument(
         "--stroke-facilities",
-        default="Data_vietnam/stroke-facs-100-en.csv",
+        default=str(DATA_DIR / "stroke-facs-100-en.csv"),
         help="Path to CSV file with specialized-equipment information"
     )
     parser.add_argument(
         "--output",
-        default="population_map.html",
+        default=str(OUTPUTS_DIR / "maps" / "scenario_explorer_km.html"),
         help="Output HTML file path"
     )
     parser.add_argument(
@@ -1297,6 +1384,31 @@ if __name__ == "__main__":
         default=None,
         help="Only process population points with latitude <= this value"
     )
+    parser.add_argument(
+        "--scenarios",
+        default=str(OUTPUTS_DIR / "combined_scenarios_km.json"),
+        help="Path to a combined_scenarios_*.json for the scenario explorer overlay "
+             "(set to '' to disable the overlay)"
+    )
+    parser.add_argument(
+        "--intensity-circles",
+        action="store_true",
+        help="Add the ~134k-circle population intensity layer (bloats HTML to ~70 MB; "
+             "off by default since the heatmap already shows density)"
+    )
+    parser.add_argument(
+        "--time-model",
+        choices=["flat", "road"],
+        default="flat",
+        help="flat = one average speed (distance/40 km/h); "
+             "road = fastest route using differentiated per-road-type speeds"
+    )
+    parser.add_argument(
+        "--underserved-assignments",
+        default=str(OUTPUTS_DIR / "combined_model_results" / "assignments.csv"),
+        help="CSV of covered points (pop_id) from a representative optimum; adds a "
+             "hidden 'underserved population' equity heatmap. Set to '' to disable."
+    )
 
     args = parser.parse_args()
 
@@ -1310,4 +1422,8 @@ if __name__ == "__main__":
         max_marker_points=args.max_marker_points,
         min_lat=args.min_lat,
         max_lat=args.max_lat,
+        scenarios_path=(args.scenarios or None),
+        show_intensity_circles=args.intensity_circles,
+        time_model=args.time_model,
+        underserved_assignments_path=(args.underserved_assignments or None),
     )
